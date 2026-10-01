@@ -4,7 +4,6 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, DirBuilder, File, OpenOptions},
@@ -318,7 +317,7 @@ impl Store {
                     .collect();
                 let primary = format!("{date}.jsonl");
                 let filename = if self.dir.join(&primary).try_exists()? {
-                    format!("{date}--{:x}.jsonl", Sha256::digest(&bytes))
+                    format!("{date}--{}.jsonl", crate::record::digest(b"", &bytes))
                 } else {
                     primary
                 };
