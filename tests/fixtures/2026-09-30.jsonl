@@ -1,0 +1,1 @@
+{"hash":"74db7a1617ea95bedb7ea8b52ebfbe3d7956481cc6c9175e06d299cee0dbec91","event":{"version":1,"sequence":1,"id":"example-food-1","recorded_at":"2026-09-30T12:00:00Z","previous":null,"type":"client.food","data":{"client":"alice","content":"steak and fries"}}}
