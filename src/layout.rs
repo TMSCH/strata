@@ -132,7 +132,7 @@ impl Snapshot {
             .and_then(|stem| stem.split_once("--"))
         {
             ensure!(
-                format!("{:x}", archive_hash.finalize()) == suffix,
+                crate::record::hex(&archive_hash.finalize()) == suffix,
                 "archive hash does not match filename: {name}"
             );
         }

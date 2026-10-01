@@ -86,7 +86,18 @@ pub(crate) fn digest(domain: &[u8], bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(domain);
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex(&h.finalize())
+}
+
+/// Keep the on-disk lowercase hex encoding independent of digest array APIs.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 15) as usize] as char);
+    }
+    output
 }
 
 pub(crate) fn encode(event: &Event) -> Result<(Vec<u8>, String)> {

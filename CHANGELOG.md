@@ -2,6 +2,10 @@
 
 ## 0.1.0 (unreleased)
 
+Updated SHA-256 support to sha2 0.11 while preserving v1 event hashes, request
+fingerprints, and archive filenames. Updated pinned GitHub Actions; manual release
+builds now also download and verify both packaged artifacts before publication.
+
 Compaction now detects Git repositories and retains loose events until the exact
 daily archives are committed in HEAD. Ordinary Git commits and bundle backups need
 no Strata-specific verification hook. Git failures defer cleanup without stopping

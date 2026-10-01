@@ -62,9 +62,27 @@ jobs:
           name: strata-${{ matrix.target }}
           path: strata-*.tar.gz*
           if-no-files-found: error
+  verify-artifacts:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify both downloaded release packages
+        working-directory: dist
+        run: |
+          test "$(find . -name '*.tar.gz' | wc -l)" -eq 2
+          sha256sum -c strata-*.tar.gz.sha256
+          for archive in strata-*.tar.gz; do
+            tar -tzf "$archive" | sort > contents.txt
+            printf '%s\n' FORMAT.md LICENSE README.md strata | sort > expected.txt
+            diff -u expected.txt contents.txt
+          done
   publish:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: verify-artifacts
     runs-on: ubuntu-24.04
     permissions:
       contents: write
