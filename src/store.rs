@@ -31,6 +31,15 @@ pub struct Store {
     poisoned: bool,
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly inherit the descriptor before exec
+        // closes it. Explicit unlock avoids extending our lock past Store's
+        // lifetime while such a child still holds the inherited description.
+        let _ = self._lock.unlock();
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Verification {
     pub events: u64,
