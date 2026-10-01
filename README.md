@@ -104,9 +104,16 @@ snapshot when completeness matters. There is intentionally no `strata read` comm
 
 ## Verify and use Git
 
-**The daemon can keep running during staging and commits.** The trusted commit
-owner verifies the staged snapshot before accepting it. Stop the daemon before
-checkout, reset, restore, or other operations that replace its working files.
+**The daemon can keep running during ordinary staging and commits.** When Strata
+finds a Git repository around its data directory, it keeps loose event files until
+all archives covering that day exist with the exact same bytes in the current
+commit (`HEAD`). Staging an archive alone is insufficient. No Strata-specific Git
+hook, commit wrapper, or remote is required.
+
+Stop the daemon before checkout, reset, restore, history rewriting, or other
+operations that replace its working files or rewind its committed history.
+Ordinary forward commits must preserve the immutable archives. Strata does not
+prevent an operator from explicitly staging their deletion or alteration.
 
 Add these patterns to your data repository's `.gitignore` (adjust `events/`):
 
@@ -124,39 +131,44 @@ events/**/*.json -text -merge
 events/*.jsonl -text -merge
 ```
 
-The trusted Git owner runs:
+Use your ordinary Git workflow:
 
 ```sh
 git add -A -- events
-strata verify --staged --repo . --path events
 git commit -m "Record agent events"
 ```
 
-`--path` is relative to the repository root. Verification captures the index once
-with `git write-tree` and reads the blobs from that immutable tree. It checks the
-full chain and that every event in **HEAD** remains present with identical bytes.
-It needs no daemon shutdown or store lock. The JSON result includes `events`,
-`head`, `baseline_events`, `tree`, and `baseline_commit`.
+Strata detects ordinary repositories, nested data directories, submodules, and
+linked worktrees through their `.git` markers. It checks again during each cleanup
+pass, so a repository initialized after daemon startup is recognized. Git errors,
+an unborn HEAD, ignored archives, or mismatched committed bytes delay cleanup;
+appending remains available. Outside a repository, cleanup follows durable archive
+publication immediately. Git is only needed for cleanup inside a repository.
+Inherited `GIT_*` routing variables do not redirect these cleanup checks.
 
-The commit owner must exclusively control the index and baseline reference during
-this sequence. No other staging or hook may change the index between verification
-and commit. For automated orchestration, create a commit directly from the returned
-`tree` using `git commit-tree`, then advance the branch with a compare-and-swap
-against the expected old commit. Strata verifies snapshots; it does not own Git
-commits, pushes, credentials, or that coordination.
+Once an archive is committed, the next maintenance pass can remove the loose
+files. A subsequent ordinary commit can record those deletions: its predecessor
+already contains the archive. Archive/loose-file overlap counts as the same events.
+This works with a local-only repository backed up as Git bundles; Strata neither
+checks nor requires a push or an R2 upload.
 
-If concurrent append/compaction produces an incomplete staged snapshot, verification
-fails: stage again and retry. A successful check can represent an earlier complete
-prefix; new events published too late for that scan go into the next commit.
-Identical events in both loose files and an archive count once. A successful plain
-`git add` or `git commit` alone does not establish these guarantees.
+Staged verification remains an **optional audit**, useful for checking chain
+consistency or guarding against external edits:
 
-For the first commit of an unborn repository, explicitly use `--initial`. If HEAD
-already exists but contains no events, normal verification works. To anchor against
-a different independently trusted commit, use `--baseline-ref <commit>`. The
-trusted owner chooses the baseline; agents must not be able to replace it or select
-an older one. Independent divergent branch writes/merges remain unsupported.
-Delegate agents can share the single daemon while working on separate code branches.
+```sh
+strata verify --staged --repo . --path events
+```
+
+It captures the index as one immutable Git tree, validates the event chain, and
+checks preservation of every event from HEAD. The result includes `events`, `head`,
+`baseline_events`, `tree`, and `baseline_commit`. `--path` is repository-relative;
+use `--initial` only before the first commit, or `--baseline-ref <commit>` for an
+independently trusted baseline. If using this audit as a commit gate, commit the
+returned tree or keep exclusive control of the unchanged index until commit.
+It is not required for commit-aware compaction. New events can miss a staging pass
+and enter a later commit; Git does not capture the entire live directory at once.
+Independent divergent branch writes/merges remain unsupported. Delegate agents can
+share one daemon while using separate code branches.
 
 Offline verification is also available and takes the writer lock:
 
@@ -175,7 +187,7 @@ baseline. They do not authenticate authors or prove event truth.
 The daemon checks for completed days at startup, on a new-day append, and every
 minute. Library users can call `Store::compact()` periodically. Compaction publishes
 and synchronizes the archive **before** deleting any loose files. Restart validates
-and deduplicates any overlap, then finishes cleanup. Archived records are never
+and deduplicates any overlap, then finishes cleanup once the Git condition is met. Archived records are never
 rewritten. Old daily JSONL stores remain readable; if a day already has an archive
 and additional loose events, compaction writes an immutable
 `YYYY-MM-DD--<archive-sha256>.jsonl` supplement.

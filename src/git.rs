@@ -146,3 +146,89 @@ pub fn verify_staged(
         baseline_commit,
     })
 }
+
+/// Cleanup must not mistake Git failure for absence of a repository. Discover
+/// filesystem markers ourselves, including linked worktrees/submodules (.git files).
+/// Ignore inherited Git routing variables so they cannot select another repository.
+pub(crate) fn archives_committed(dir: &Path, archives: &[String]) -> Result<bool> {
+    let dir = dir.canonicalize()?;
+    let mut root = None;
+    for ancestor in dir.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => {
+                root = Some(ancestor);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
+        // A bare repository is not an ordinary non-Git directory for cleanup.
+        if ancestor.join("HEAD").exists()
+            && ancestor.join("objects").is_dir()
+            && ancestor.join("refs").is_dir()
+        {
+            return Ok(false);
+        }
+    }
+    let Some(root) = root else {
+        return Ok(true);
+    };
+    let run = |args: &[&std::ffi::OsStr]| -> Result<Vec<u8>> {
+        let mut cmd = command(root);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(key);
+            }
+        }
+        let output = cmd
+            .args(args)
+            .output()
+            .context("check committed archives")?;
+        ensure!(
+            output.status.success(),
+            "Git could not confirm committed archives; retaining loose events"
+        );
+        Ok(output.stdout)
+    };
+    use std::ffi::OsStr;
+    let head = run(&[
+        OsStr::new("rev-parse"),
+        OsStr::new("--verify"),
+        OsStr::new("HEAD^{commit}"),
+    ])?;
+    let head = std::str::from_utf8(&head)?.trim();
+    for archive in archives {
+        let path = dir.join(archive);
+        let relative = path.strip_prefix(root)?;
+        // Literal pathspec handles spaces, brackets, and colon-prefixed folders.
+        let mut spec = std::ffi::OsString::from(":(literal)");
+        spec.push(relative);
+        let entry = run(&[
+            OsStr::new("ls-tree"),
+            OsStr::new("-z"),
+            OsStr::new("--full-tree"),
+            OsStr::new(head),
+            OsStr::new("--"),
+            &spec,
+        ])?;
+        let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+            return Ok(false);
+        };
+        let header = std::str::from_utf8(&entry[..tab])?;
+        let Some(blob) = header.strip_prefix("100644 blob ") else {
+            return Ok(false);
+        };
+        let actual = run(&[
+            OsStr::new("hash-object"),
+            OsStr::new("--no-filters"),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ])?;
+        if std::str::from_utf8(&actual)?.trim() != blob {
+            return Ok(false);
+        }
+    }
+    // Ordinary forward commits keep immutable archives. Rewinds/checkouts and
+    // external edits still require stopping the daemon, as with all store files.
+    Ok(true)
+}

@@ -81,7 +81,8 @@ fn files(dir: &Path) -> Result<Vec<String>> {
             .file_name()
             .into_string()
             .map_err(|_| anyhow::anyhow!("non-UTF-8 store filename"))?;
-        if name == ".strata.lock"
+        if name == ".git"
+            || name == ".strata.lock"
             || name.starts_with(".strata-recovery-")
             || layout::auxiliary(&name)
         {
@@ -313,6 +314,20 @@ impl Store {
                     primary
                 };
                 self.publish(&filename, &bytes)?;
+            }
+            // Every archive for this day must be present byte-for-byte in HEAD.
+            // Staging alone is insufficient. Failure only delays cleanup.
+            let archives: Vec<_> = files(&self.dir)?
+                .into_iter()
+                .filter(|name| !name.contains('/') && name.starts_with(date))
+                .collect();
+            match crate::git::archives_committed(&self.dir, &archives) {
+                Ok(true) => (),
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!("strata: cleanup deferred: {error:#}");
+                    continue;
+                }
             }
             // Archives are synchronized before any source is removed.
             for name in loose {
