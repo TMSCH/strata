@@ -27,8 +27,8 @@ With Rust installed:
 cargo install --locked --git https://github.com/TMSCH/strata strata-log
 ```
 
-For reproducible installs, add `--rev <reviewed-commit>` or `--tag v0.1.0` once
-that tag has been released. Release archives are built for Linux x86-64 (static musl) and
+For reproducible installs, add `--rev <reviewed-commit>` or `--tag v0.1.1`.
+Release archives are built for Linux x86-64 (static musl) and
 macOS ARM64; see [releases](https://github.com/TMSCH/strata/releases). No crates.io
 publication is required. The library crate is named `strata`; its package is
 `strata-log`.

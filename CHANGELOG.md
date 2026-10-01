@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.1
+
+- Added opt-in `serve --group-readable` and `--group-append` for separate writer
+  and agent accounts. Group members can read published events and submit appends;
+  event files remain non-writable by the group. Defaults remain private.
+- Existing records require an offline permission migration when enabling group
+  reading; the daemon does not change permissions across historical files.
+- Staged verification now reads Git objects through one batch process per tree,
+  improving performance for histories with many loose event files.
+
+## 0.1.0
 
 Updated SHA-256 support to sha2 0.11 while preserving v1 event hashes, request
 fingerprints, and archive filenames. Updated pinned GitHub Actions; manual release
