@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{BufReader, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -28,6 +28,7 @@ pub struct Store {
     head: Option<String>,
     last_time: Option<OffsetDateTime>,
     poisoned: bool,
+    group_readable: bool,
 }
 
 impl Drop for Store {
@@ -143,8 +144,18 @@ fn snapshot(dir: &Path) -> Result<Snapshot> {
 
 impl Store {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_group_read(dir, false)
+    }
+
+    /// Allow the owning group to traverse new directories and read published events.
+    /// Existing records retain their permissions; operators must migrate those offline.
+    /// Never grants group write access. The process primary group selects the readers.
+    pub fn open_with_group_read(dir: impl AsRef<Path>, group_readable: bool) -> Result<Self> {
         let dir = dir.as_ref();
         create_dir(dir).context("create store (its parent must already exist)")?;
+        if group_readable {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o750))?;
+        }
         let lock = open_regular(&dir.join(".strata.lock"), true, true)?;
         lock.try_lock()
             .context("store is already in use; use verify --staged for live Git snapshots")?;
@@ -162,6 +173,7 @@ impl Store {
             head: None,
             last_time: None,
             poisoned: false,
+            group_readable,
         };
         store.load(&data)?;
         Ok(store)
@@ -239,6 +251,9 @@ impl Store {
         };
         self.poisoned = true;
         create_dir(&self.dir.join(folder))?;
+        if self.group_readable {
+            fs::set_permissions(self.dir.join(folder), fs::Permissions::from_mode(0o750))?;
+        }
         File::open(&self.dir)?.sync_all()?;
         self.publish(&filename, &bytes)?;
         self.sequence = event.sequence;
@@ -261,6 +276,10 @@ impl Store {
         create_dir(&temporary)?;
         let mut file = tempfile::NamedTempFile::new_in(&temporary)?;
         file.write_all(bytes)?;
+        if self.group_readable {
+            file.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o640))?;
+        }
         file.as_file().sync_all()?;
         let target = self.dir.join(filename);
         // Do not fall back to a hard link: a crash between link/unlink would

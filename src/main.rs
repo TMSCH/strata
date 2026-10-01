@@ -27,6 +27,12 @@ enum Command {
     },
     /// Operator: run the single-writer daemon in the foreground.
     Serve {
+        /// Give the owning group read access to newly published records.
+        #[arg(long)]
+        group_readable: bool,
+        /// Let members of the socket owning group submit appends.
+        #[arg(long)]
+        group_append: bool,
         #[arg(long)]
         dir: PathBuf,
         #[arg(long, env = "STRATA_SOCKET")]
@@ -69,8 +75,17 @@ fn run() -> Result<()> {
             let receipt = protocol::append(&socket, &Append { id, kind, data })?;
             println!("{}", serde_json::to_string(&receipt)?);
         }
-        Command::Serve { dir, socket } => {
-            protocol::serve(Store::open(dir)?, &socket)?;
+        Command::Serve {
+            dir,
+            socket,
+            group_readable,
+            group_append,
+        } => {
+            protocol::serve_with_group_access(
+                Store::open_with_group_read(dir, group_readable)?,
+                &socket,
+                group_append,
+            )?;
         }
         Command::Verify {
             dir,

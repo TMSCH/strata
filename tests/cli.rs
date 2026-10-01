@@ -289,3 +289,66 @@ fn independent_python_generated_format_vector() {
     let status = strata::verify(dir.path(), None).unwrap();
     assert_eq!(status.events, 1);
 }
+
+#[test]
+fn opt_in_group_permissions_keep_agent_read_only() {
+    let dir = tempdir().unwrap();
+    let runtime = tempfile::Builder::new()
+        .prefix("strata-grp-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = runtime.path().join("s");
+    let child = Command::new(BIN)
+        .arg("serve")
+        .arg("--dir")
+        .arg(dir.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--group-readable")
+        .arg("--group-append")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut daemon = Daemon {
+        child,
+        dir,
+        socket,
+        runtime,
+    };
+    daemon.ready();
+    let receipt = protocol::append(&daemon.socket, &request("readers")).unwrap();
+    let path = daemon.dir.path().join(receipt.file);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_eq!(
+        fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o750
+    );
+    assert_eq!(
+        fs::metadata(&daemon.socket).unwrap().permissions().mode() & 0o777,
+        0o660
+    );
+    assert_eq!(
+        fs::metadata(daemon.dir.path().join(".strata.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(daemon.dir.path().join(".strata-tmp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}

@@ -265,3 +265,14 @@ and audits dependencies against RustSec. Release workflow dispatch builds downlo
 archives without publishing. Pushing a reviewed `v<package-version>` tag builds and
 tests both targets, then publishes archives and SHA-256 checksums to GitHub Releases.
 No automatic installation or integration with Nester is performed.
+
+### Separate writer and agent accounts
+
+Operators can opt into `strata serve --group-readable --group-append`.
+Run the daemon as a dedicated writer user with an agent-readable primary group.
+New published records are mode 0640, store/date directories 0750, and the socket
+0660. Lock files and unpublished temporary directories stay private. Defaults
+remain private (0600/0700). Existing records need an offline permission migration.
+The socket parent must still be operator-owned and not group-writable. Protect
+the store parent and Git metadata from the agent as well. Group membership grants
+append access, not caller authentication or permission to rewrite old events.

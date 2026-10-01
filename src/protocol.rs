@@ -62,7 +62,12 @@ fn handle(mut stream: UnixStream, store: &Mutex<Store>) -> Result<()> {
 
 /// Blocking local server with four fixed workers and one serialized writer.
 /// Socket parent directory must be private and controlled by the operator.
-pub fn serve(mut store: Store, socket: &Path) -> Result<()> {
+pub fn serve(store: Store, socket: &Path) -> Result<()> {
+    serve_with_group_access(store, socket, false)
+}
+
+/// Optionally allow the socket owning group to submit appends (not rewrite files).
+pub fn serve_with_group_access(mut store: Store, socket: &Path, group_append: bool) -> Result<()> {
     let parent = socket
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -108,7 +113,10 @@ pub fn serve(mut store: Store, socket: &Path) -> Result<()> {
     }
     let listener =
         UnixListener::bind(socket).context("bind Unix socket (use a short absolute path)")?;
-    fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(
+        socket,
+        fs::Permissions::from_mode(if group_append { 0o660 } else { 0o600 }),
+    )?;
     store.compact()?;
     let store = Arc::new(Mutex::new(store));
     eprintln!("strata: listening on {}", socket.display());
