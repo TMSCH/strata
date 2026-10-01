@@ -47,6 +47,7 @@ jobs:
           rustup target add "$TARGET"
           cargo build --release --locked --target "$TARGET"
           "target/$TARGET/release/strata" --version
+          python3 scripts/smoke.py "target/$TARGET/release/strata"
       - name: Package binary
         env:
           TARGET: ${{ matrix.target }}
