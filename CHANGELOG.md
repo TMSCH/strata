@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2
+
+- Release archives now include signed GitHub build provenance.
+- Publication requires attestation verification against the repository, release
+  workflow, exact source commit and ref, and GitHub-hosted runners.
+- Documented consumer verification alongside independently pinned SHA-256 values.
+- No event-format or runtime behavior changes. Earlier release assets remain unchanged.
+
 ## 0.1.1
 
 - Added opt-in `serve --group-readable` and `--group-append` for separate writer
