@@ -1,4 +1,5 @@
 use super::*;
+use crate::record::{MAX_RECORD, decode};
 use serde_json::json;
 use std::os::unix::fs::symlink;
 use tempfile::tempdir;
@@ -17,43 +18,254 @@ fn at(day: u8) -> OffsetDateTime {
         .unwrap()
         .assume_utc()
 }
-fn logs(dir: &Path) -> Vec<u8> {
-    files(dir)
-        .unwrap()
-        .iter()
-        .flat_map(|p| fs::read(p).unwrap())
-        .collect()
+
+#[test]
+fn immutable_append_restart_retry_and_conflict() {
+    let dir = tempdir().unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let a = s.append_at(request("a"), at(29)).unwrap();
+    let original = fs::read(dir.path().join(&a.file)).unwrap();
+    assert_eq!(a.file, format!("2026-09-29/{}.json", a.hash));
+    let b = s.append_at(request("b"), at(29)).unwrap();
+    assert_eq!(fs::read(dir.path().join(&a.file)).unwrap(), original);
+    assert_eq!(
+        decode(&fs::read(dir.path().join(&b.file)).unwrap())
+            .unwrap()
+            .0
+            .previous,
+        Some(a.hash.clone())
+    );
+    drop(s);
+    let mut s = Store::open(dir.path()).unwrap();
+    assert_eq!(s.append_at(request("a"), at(30)).unwrap(), a);
+    let mut different = request("a");
+    different.data = json!({"different":true});
+    assert!(s.append_at(different, at(30)).is_err());
 }
 
 #[test]
-fn append_restart_retry_and_conflicting_id() {
+fn rollover_compacts_exact_bytes_and_retry_location() {
     let dir = tempdir().unwrap();
-    let first;
-    {
-        let mut s = Store::open(dir.path()).unwrap();
-        first = s.append_at(request("one"), at(29)).unwrap();
-        assert_eq!(s.append_at(request("one"), at(30)).unwrap(), first);
-    }
     let mut s = Store::open(dir.path()).unwrap();
-    assert_eq!(s.append_at(request("one"), at(30)).unwrap(), first);
-    let mut conflict = request("one");
-    conflict.data = json!({"different":true});
-    assert!(s.append_at(conflict, at(30)).is_err());
-    assert_eq!(s.append_at(request("two"), at(30)).unwrap().sequence, 2);
+    let a = s.append_at(request("a"), at(29)).unwrap();
+    let b = s.append_at(request("b"), at(29)).unwrap();
+    let bytes = [
+        fs::read(dir.path().join(&a.file)).unwrap(),
+        fs::read(dir.path().join(&b.file)).unwrap(),
+    ]
+    .concat();
+    s.compact_before("2026-09-29").unwrap();
+    assert!(dir.path().join(&a.file).exists());
+    let c = s.append_at(request("c"), at(30)).unwrap();
+    assert!(!dir.path().join("2026-09-29").exists());
+    assert_eq!(
+        fs::read(dir.path().join("2026-09-29.jsonl")).unwrap(),
+        bytes
+    );
+    let retry = s.append_at(request("a"), at(30)).unwrap();
+    assert_eq!(retry.hash, a.hash);
+    assert_eq!(retry.file, "2026-09-29.jsonl");
+    assert_eq!(
+        decode(&fs::read(dir.path().join(c.file)).unwrap())
+            .unwrap()
+            .0
+            .previous,
+        Some(b.hash)
+    );
+    s.compact_before("2026-09-30").unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("2026-09-29.jsonl")).unwrap(),
+        bytes
+    );
+    drop(s);
+    assert_eq!(verify(dir.path(), None).unwrap().events, 3);
+}
+
+#[test]
+fn restart_at_each_compaction_boundary() {
+    // Archive absent, published with all sources, and every partial cleanup.
+    for removed in 0..=3 {
+        let dir = tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let receipts: Vec<_> = (0..3)
+            .map(|i| s.append_at(request(&format!("e{i}")), at(29)).unwrap())
+            .collect();
+        let bytes: Vec<_> = receipts
+            .iter()
+            .flat_map(|r| fs::read(dir.path().join(&r.file)).unwrap())
+            .collect();
+        s.publish("2026-09-29.jsonl", &bytes).unwrap();
+        for r in receipts.iter().take(removed) {
+            fs::remove_file(dir.path().join(&r.file)).unwrap();
+        }
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.status().events, 3);
+        s.compact_before("2026-09-30").unwrap();
+        assert_eq!(
+            s.append_at(request("e0"), at(30)).unwrap().hash,
+            receipts[0].hash
+        );
+        assert_eq!(
+            fs::read(dir.path().join("2026-09-29.jsonl")).unwrap(),
+            bytes
+        );
+        assert_eq!(files(dir.path()).unwrap(), vec!["2026-09-29.jsonl"]);
+    }
+}
+
+#[test]
+fn legacy_daily_archive_stays_immutable_with_new_same_day_events() {
+    let dir = tempdir().unwrap();
+    let fixture = include_bytes!("../../tests/fixtures/2026-09-30.jsonl");
+    fs::write(dir.path().join("2026-09-30.jsonl"), fixture).unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    s.append_at(request("new"), at(30)).unwrap();
+    s.compact_before("2026-10-01").unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("2026-09-30.jsonl")).unwrap(),
+        fixture
+    );
+    assert_eq!(files(dir.path()).unwrap().len(), 2);
+    assert!(
+        files(dir.path())
+            .unwrap()
+            .iter()
+            .any(|n| n.starts_with("2026-09-30--"))
+    );
     drop(s);
     assert_eq!(verify(dir.path(), None).unwrap().events, 2);
 }
 
 #[test]
-fn rollover_links_files_and_leaves_yesterday_unchanged() {
+fn publication_never_overwrites_and_failed_write_poisoning() {
     let dir = tempdir().unwrap();
     let mut s = Store::open(dir.path()).unwrap();
+    let r = s.append_at(request("a"), at(30)).unwrap();
+    let original = fs::read(dir.path().join(&r.file)).unwrap();
+    assert!(s.publish(&r.file, b"replacement").is_err());
+    assert_eq!(fs::read(dir.path().join(&r.file)).unwrap(), original);
+    fs::remove_dir(dir.path().join(".strata-tmp")).unwrap();
+    fs::write(dir.path().join(".strata-tmp"), b"block publication").unwrap();
+    assert!(s.append_at(request("b"), at(30)).is_err());
+    fs::remove_file(dir.path().join(".strata-tmp")).unwrap();
+    assert!(
+        s.append_at(request("b"), at(30))
+            .unwrap_err()
+            .to_string()
+            .contains("storage error")
+    );
+    drop(s);
+    let mut s = Store::open(dir.path()).unwrap();
+    assert_eq!(s.append_at(request("b"), at(30)).unwrap().sequence, 2);
+}
+
+#[test]
+fn unpublished_torn_files_are_ignored_but_public_torn_files_fail() {
+    let source = tempdir().unwrap();
+    let mut s = Store::open(source.path()).unwrap();
+    let r = s.append_at(request("a"), at(30)).unwrap();
+    let bytes = fs::read(source.path().join(&r.file)).unwrap();
+    drop(s);
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".strata-tmp")).unwrap();
+    fs::create_dir(dir.path().join("2026-09-30")).unwrap();
+    for cut in 0..bytes.len() {
+        fs::write(dir.path().join(".strata-tmp/unpublished"), &bytes[..cut]).unwrap();
+        assert_eq!(Store::open(dir.path()).unwrap().status().events, 0);
+        fs::write(dir.path().join(&r.file), &bytes[..cut]).unwrap();
+        assert!(Store::open(dir.path()).is_err(), "cut {cut}");
+        assert_eq!(fs::read(dir.path().join(&r.file)).unwrap(), bytes[..cut]);
+        fs::remove_file(dir.path().join(&r.file)).unwrap();
+    }
+    fs::write(dir.path().join(&r.file), &bytes).unwrap();
+    assert_eq!(
+        Store::open(dir.path())
+            .unwrap()
+            .append_at(request("a"), at(30))
+            .unwrap(),
+        r
+    );
+}
+
+#[test]
+fn rejects_edits_missing_middle_wrong_names_and_conflicting_sequences() {
+    for mutation in 0..5 {
+        let dir = tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let a = s.append_at(request("a"), at(30)).unwrap();
+        let b = s.append_at(request("b"), at(30)).unwrap();
+        s.append_at(request("c"), at(30)).unwrap();
+        drop(s);
+        let path = dir.path().join(&b.file);
+        let bytes = fs::read(&path).unwrap();
+        match mutation {
+            0 => fs::write(
+                &path,
+                String::from_utf8(bytes).unwrap().replace("steak", "salad"),
+            )
+            .unwrap(),
+            1 => fs::remove_file(&path).unwrap(),
+            2 => {
+                fs::rename(
+                    &path,
+                    dir.path()
+                        .join(format!("2026-09-30/{}.json", "0".repeat(64))),
+                )
+                .unwrap();
+            }
+            3 => {
+                let mut bytes = bytes;
+                bytes.insert(1, b' ');
+                fs::write(&path, bytes).unwrap();
+            }
+            _ => {
+                let (mut event, _) = decode(&fs::read(dir.path().join(a.file)).unwrap()).unwrap();
+                event.id = "conflict".into();
+                fs::write(
+                    dir.path().join("2026-09-30.jsonl"),
+                    encode(&event).unwrap().0,
+                )
+                .unwrap();
+            }
+        }
+        assert!(Store::open(dir.path()).is_err(), "mutation {mutation}");
+    }
+}
+
+#[test]
+fn baseline_survives_compaction_but_detects_deleted_tail_and_rewrites() {
+    let baseline = tempdir().unwrap();
+    let current = tempdir().unwrap();
+    let mut s = Store::open(baseline.path()).unwrap();
     let a = s.append_at(request("a"), at(29)).unwrap();
-    let yesterday = logs(dir.path());
-    let b = s.append_at(request("b"), at(30)).unwrap();
-    assert_eq!(fs::read(dir.path().join(a.file)).unwrap(), yesterday);
-    let (event, _) = decode(&fs::read(dir.path().join(b.file)).unwrap()).unwrap();
-    assert_eq!(event.previous, Some(a.hash));
+    let first = fs::read(baseline.path().join(&a.file)).unwrap();
+    let b = s.append_at(request("b"), at(29)).unwrap();
+    let all = [
+        first.clone(),
+        fs::read(baseline.path().join(b.file)).unwrap(),
+    ]
+    .concat();
+    drop(s);
+    fs::write(current.path().join("2026-09-29.jsonl"), &all).unwrap();
+    assert_eq!(
+        verify(current.path(), Some(baseline.path()))
+            .unwrap()
+            .baseline_events,
+        Some(2)
+    );
+    fs::write(current.path().join("2026-09-29.jsonl"), first).unwrap();
+    assert!(verify(current.path(), None).is_ok());
+    assert!(verify(current.path(), Some(baseline.path())).is_err());
+    let (mut event, _) = decode(&fs::read(baseline.path().join(a.file)).unwrap()).unwrap();
+    event.data = json!({"rewritten":true});
+    fs::write(
+        current.path().join("2026-09-29.jsonl"),
+        encode(&event).unwrap().0,
+    )
+    .unwrap();
+    assert!(verify(current.path(), None).is_ok());
+    assert!(verify(current.path(), Some(baseline.path())).is_err());
 }
 
 #[test]
@@ -73,143 +285,6 @@ fn exclusive_writer_and_offline_verifier() {
     assert!(verify(dir.path(), None).is_err());
     drop(s);
     assert!(Store::open(dir.path()).is_ok());
-}
-
-#[test]
-fn rejects_edits_deletions_reordering_and_bad_encoding() {
-    for mutation in 0..5 {
-        let dir = tempdir().unwrap();
-        let mut s = Store::open(dir.path()).unwrap();
-        for id in ["a", "b", "c"] {
-            s.append_at(request(id), at(30)).unwrap();
-        }
-        drop(s);
-        let path = dir.path().join("2026-09-30.jsonl");
-        let original = fs::read_to_string(&path).unwrap();
-        let mut lines: Vec<_> = original.lines().map(str::to_owned).collect();
-        match mutation {
-            0 => lines[0] = lines[0].replace("steak", "salad"),
-            1 => {
-                lines.remove(1);
-            }
-            2 => lines.swap(0, 1),
-            3 => lines[0].insert(1, ' '),
-            _ => lines.push(lines[0].clone()),
-        }
-        fs::write(path, lines.join("\n") + "\n").unwrap();
-        assert!(
-            Store::open_with_recovery(dir.path(), true).is_err(),
-            "mutation {mutation}"
-        );
-    }
-}
-
-#[test]
-fn detects_tail_deletion_with_baseline() {
-    let baseline = tempdir().unwrap();
-    let current = tempdir().unwrap();
-    let mut s = Store::open(baseline.path()).unwrap();
-    s.append_at(request("a"), at(30)).unwrap();
-    let first = logs(baseline.path());
-    s.append_at(request("b"), at(30)).unwrap();
-    drop(s);
-    fs::write(current.path().join("2026-09-30.jsonl"), first).unwrap();
-    assert!(verify(current.path(), None).is_ok());
-    assert!(verify(current.path(), Some(baseline.path())).is_err());
-}
-
-#[test]
-fn baseline_accepts_extension_and_rejects_rewritten_history() {
-    let baseline = tempdir().unwrap();
-    let current = tempdir().unwrap();
-    let mut s = Store::open(baseline.path()).unwrap();
-    s.append_at(request("a"), at(29)).unwrap();
-    drop(s);
-    fs::copy(
-        baseline.path().join("2026-09-29.jsonl"),
-        current.path().join("2026-09-29.jsonl"),
-    )
-    .unwrap();
-    let mut s = Store::open(current.path()).unwrap();
-    s.append_at(request("b"), at(30)).unwrap();
-    drop(s);
-    assert_eq!(
-        verify(current.path(), Some(baseline.path()))
-            .unwrap()
-            .baseline_events,
-        Some(1)
-    );
-    let rewritten = tempdir().unwrap();
-    let mut s = Store::open(rewritten.path()).unwrap();
-    let mut a = request("a");
-    a.data = json!({"changed":true});
-    s.append_at(a, at(29)).unwrap();
-    drop(s);
-    assert!(verify(rewritten.path(), Some(baseline.path())).is_err());
-}
-
-#[test]
-fn recovery_at_every_possible_torn_write_boundary() {
-    let source = tempdir().unwrap();
-    let mut s = Store::open(source.path()).unwrap();
-    s.append_at(request("a"), at(30)).unwrap();
-    let first = logs(source.path());
-    let receipt = s.append_at(request("b"), at(30)).unwrap();
-    let all = logs(source.path());
-    let second = &all[first.len()..];
-    drop(s);
-    for cut in 1..second.len() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("2026-09-30.jsonl");
-        let mut torn = first.clone();
-        torn.extend_from_slice(&second[..cut]);
-        fs::write(&path, &torn).unwrap();
-        assert!(Store::open(dir.path()).is_err());
-        assert_eq!(fs::read(&path).unwrap(), torn);
-        let mut recovered = Store::open_with_recovery(dir.path(), true).unwrap();
-        assert_eq!(recovered.status().events, 1);
-        assert_eq!(fs::read(&path).unwrap(), first);
-        let backups: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|e| e == "bin"))
-            .collect();
-        assert_eq!(backups.len(), 1);
-        assert_eq!(fs::read(&backups[0]).unwrap(), second[..cut]);
-        assert_eq!(recovered.append_at(request("b"), at(30)).unwrap(), receipt);
-    }
-}
-
-#[test]
-fn recovery_never_truncates_an_older_day() {
-    let dir = tempdir().unwrap();
-    let mut s = Store::open(dir.path()).unwrap();
-    s.append_at(request("a"), at(29)).unwrap();
-    s.append_at(request("b"), at(30)).unwrap();
-    drop(s);
-    let path = dir.path().join("2026-09-29.jsonl");
-    let bytes = fs::read(&path).unwrap();
-    fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
-    assert!(Store::open_with_recovery(dir.path(), true).is_err());
-}
-
-#[test]
-fn completed_unacknowledged_record_survives_reopen() {
-    let dir = tempdir().unwrap();
-    let mut s = Store::open(dir.path()).unwrap();
-    let receipt = s.append_at(request("a"), at(30)).unwrap();
-    drop(s);
-    let mut s = Store::open_with_recovery(dir.path(), true).unwrap();
-    assert_eq!(s.append_at(request("a"), at(30)).unwrap(), receipt);
-}
-
-#[test]
-fn malformed_completed_line_is_never_repaired() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("2026-09-30.jsonl");
-    fs::write(&path, b"bad json\n").unwrap();
-    assert!(Store::open_with_recovery(dir.path(), true).is_err());
-    assert_eq!(fs::read(path).unwrap(), b"bad json\n");
 }
 
 #[test]
@@ -243,22 +318,6 @@ fn bad_filename_is_an_error_not_a_panic() {
         fs::write(dir.path().join(name), b"").unwrap();
     }
     assert!(Store::open(dir.path()).is_err());
-}
-
-#[test]
-fn storage_failure_poisoning_prevents_further_appends() {
-    let dir = tempdir().unwrap();
-    let mut s = Store::open(dir.path()).unwrap();
-    let path = dir.path().join("2026-09-30.jsonl");
-    fs::create_dir(&path).unwrap();
-    assert!(s.append_at(request("a"), at(30)).is_err());
-    fs::remove_dir(path).unwrap();
-    assert!(
-        s.append_at(request("a"), at(30))
-            .unwrap_err()
-            .to_string()
-            .contains("storage error")
-    );
 }
 
 #[test]
@@ -310,4 +369,30 @@ fn creates_only_leaf_directory_and_rejects_missing_parent() {
     assert!(Store::open(&leaf).is_ok());
     assert!(leaf.is_dir());
     assert!(Store::open(root.path().join("missing/events")).is_err());
+}
+
+#[test]
+fn archive_order_duplicates_and_supplement_hash_are_checked() {
+    let source = tempdir().unwrap();
+    let mut store = Store::open(source.path()).unwrap();
+    let a = store.append_at(request("a"), at(30)).unwrap();
+    let b = store.append_at(request("b"), at(30)).unwrap();
+    let first = fs::read(source.path().join(a.file)).unwrap();
+    let second = fs::read(source.path().join(b.file)).unwrap();
+    for bytes in [
+        [second.clone(), first.clone()].concat(),
+        [first.clone(), first.clone()].concat(),
+    ] {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("2026-09-30.jsonl"), bytes).unwrap();
+        assert!(Store::open(dir.path()).is_err());
+    }
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path()
+            .join(format!("2026-09-30--{}.jsonl", "0".repeat(64))),
+        first,
+    )
+    .unwrap();
+    assert!(Store::open(dir.path()).is_err());
 }

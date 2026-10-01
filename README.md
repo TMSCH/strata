@@ -1,17 +1,21 @@
 # Strata
 
 A small, local, append-only event store for personal agents. Rust library and
-CLI. One daemon, many clients, daily JSONL files you can read with ordinary tools.
+CLI. One daemon, many clients, ordinary JSON files with daily JSONL archives.
 
 ```text
 events/
   2026-09-29.jsonl
   2026-09-30.jsonl
-  2026-10-01.jsonl
+  2026-10-01/
+    <event-hash>.json
+    <another-event-hash>.json
 ```
 
 Events are hash-linked across days. The writer never edits completed records.
-There is no query language, read server, index database, compaction, or distributed
+New events are published as complete, immutable files. After a UTC day ends, the
+daemon archives its events into one immutable JSONL file, then removes the loose
+files. There is no query language, read server, index database, or distributed
 coordination. Intended for modest personal-agent histories on macOS and Linux.
 This is an initial implementation, not an independently audited storage system.
 
@@ -58,13 +62,14 @@ printf '%s\n' '{"client":"alice","content":"steak and fries"}' |
 ```
 
 Input is one JSON object on stdin. Successful stdout is a JSON receipt containing
-`id`, `sequence`, `hash`, and the daily `file`. Errors and diagnostics use stderr;
+`id`, `sequence`, `hash`, and a current `file` location. Errors and diagnostics use stderr;
 errors exit nonzero. There are no terminal prompts.
 
 `--id` is optional: a UUID is generated and printed to stderr before contacting
 the daemon. Prefer a stable caller-provided ID. If the result is uncertain (timeout,
 disconnection, or crash), retry **the same ID and content**. This returns the
-original receipt, even after restart. Reusing an ID for different content fails.
+same event identity, sequence, and hash, even after restart. The `file` hint can
+change after compaction; it is not a permanent path. Reusing an ID for different content fails.
 IDs are unique across the whole store. A retry identifier does not guarantee
 exactly-once execution of anything outside Strata.
 
@@ -77,76 +82,110 @@ Data must be an object. Do not put secrets into a history you plan to retain in 
 Each line is a complete event envelope, including its type and payload:
 
 ```sh
-rg 'client.food' events/
-jq -c 'select(.event.type == "client.food") | .event.data' events/*.jsonl
+rg -g '*.json' -g '*.jsonl' 'client.food' events/
 ```
 
-Text search is approximate; JSON parsing gives exact field matches. Dates are
-UTC recording dates, not dates described by the event. Store an occurrence date
-inside `data` when needed. A live reader may encounter an incomplete last line
-while an append is in progress: ignore that suffix and retry. For a stable snapshot,
-stop the writer or read an accepted Git commit. There is intentionally no
-`strata read` command.
+Text search is approximate; JSON parsing gives exact field matches. For example,
+on an accepted Git snapshot, collect both loose files and archives, deduplicate
+by hash, and order by sequence:
+
+```sh
+find events -path 'events/.strata-tmp' -prune -o -type f \
+  \( -name '*.json' -o -name '*.jsonl' \) -exec cat {} + |
+  jq -sc 'unique_by(.hash) | sort_by(.event.sequence)[] |
+    select(.event.type == "client.food") | .event.data'
+```
+
+Dates are UTC recording dates, not dates described by the event. Store an occurrence
+date inside `data` when needed. Published files never contain partial writes.
+During compaction, live readers can see duplicate representations or a file can
+vanish between listing and opening it. Retry for casual reads; use an accepted Git
+snapshot when completeness matters. There is intentionally no `strata read` command.
 
 ## Verify and use Git
 
-Stop the daemon before verification, commits, checkout, reset, or restore. Never
-change its files underneath a running writer. Add these patterns to your data
-repository's `.gitignore` (adjust the `events/` prefix):
+**The daemon can keep running during staging and commits.** The trusted commit
+owner verifies the staged snapshot before accepting it. Stop the daemon before
+checkout, reset, restore, or other operations that replace its working files.
+
+Add these patterns to your data repository's `.gitignore` (adjust `events/`):
 
 ```gitignore
 events/.strata.lock
+events/.strata-tmp/
 events/.strata-recovery-*.bin
 ```
 
-Keep recovery backups locally until reviewed. Do not delete the lock file while
-any writer or verifier is running. Commit the JSONL files as ordinary UTF-8 text;
-do not apply formatters, line-ending conversion, or Git filters. A suitable
-`.gitattributes` rule is:
+Do not delete the lock file while a writer or verifier is running. Do not apply
+formatters, line-ending conversion, or Git filters to records. In `.gitattributes`:
 
 ```gitattributes
+events/**/*.json -text -merge
 events/*.jsonl -text -merge
 ```
 
-This keeps bytes intact and surfaces divergent edits as conflicts. It does not
-enforce append-only history. Independent branch writes/merges are unsupported.
-Delegate agents may use separate code worktrees while sharing one Strata daemon.
+The trusted Git owner runs:
+
+```sh
+git add -A -- events
+strata verify --staged --repo . --path events
+git commit -m "Record agent events"
+```
+
+`--path` is relative to the repository root. Verification captures the index once
+with `git write-tree` and reads the blobs from that immutable tree. It checks the
+full chain and that every event in **HEAD** remains present with identical bytes.
+It needs no daemon shutdown or store lock. The JSON result includes `events`,
+`head`, `baseline_events`, `tree`, and `baseline_commit`.
+
+The commit owner must exclusively control the index and baseline reference during
+this sequence. No other staging or hook may change the index between verification
+and commit. For automated orchestration, create a commit directly from the returned
+`tree` using `git commit-tree`, then advance the branch with a compare-and-swap
+against the expected old commit. Strata verifies snapshots; it does not own Git
+commits, pushes, credentials, or that coordination.
+
+If concurrent append/compaction produces an incomplete staged snapshot, verification
+fails: stage again and retry. A successful check can represent an earlier complete
+prefix; new events published too late for that scan go into the next commit.
+Identical events in both loose files and an archive count once. A successful plain
+`git add` or `git commit` alone does not establish these guarantees.
+
+For the first commit of an unborn repository, explicitly use `--initial`. If HEAD
+already exists but contains no events, normal verification works. To anchor against
+a different independently trusted commit, use `--baseline-ref <commit>`. The
+trusted owner chooses the baseline; agents must not be able to replace it or select
+an older one. Independent divergent branch writes/merges remain unsupported.
+Delegate agents can share the single daemon while working on separate code branches.
+
+Offline verification is also available and takes the writer lock:
 
 ```sh
 strata verify --dir ./events
 strata verify --dir ./events --baseline /path/to/trusted-earlier-events
 ```
 
-`verify` checks the full chain and rejects malformed or modified records. An
-independently trusted baseline additionally requires every earlier event to remain
-present and unchanged. Export the last accepted Git commit into a separate
-writable temporary directory and pass its events directory as the baseline.
-The trusted commit/push owner should enforce this before accepting a new snapshot.
-A baseline is only useful if agents cannot replace it or select an older one.
-Verification acquires an exclusive lock and requires write access for the local
-lock file; it does not modify event contents.
-
 Git backups contain only committed events. Acknowledged but uncommitted events
 are locally durable, not remotely backed up. Plain hashes cannot detect removal
 of an unreferenced tail or replacement of the entire chain without a trusted
 baseline. They do not authenticate authors or prove event truth.
 
-## Interrupted writes
+## Compaction and interrupted writes
 
-Startup verifies all completed records and fails closed on corruption. An
-incomplete final line also causes startup to fail by default. After reviewing it:
+The daemon checks for completed days at startup, on a new-day append, and every
+minute. Library users can call `Store::compact()` periodically. Compaction publishes
+and synchronizes the archive **before** deleting any loose files. Restart validates
+and deduplicates any overlap, then finishes cleanup. Archived records are never
+rewritten. Old daily JSONL stores remain readable; if a day already has an archive
+and additional loose events, compaction writes an immutable
+`YYYY-MM-DD--<archive-sha256>.jsonl` supplement.
 
-```sh
-strata serve --dir ./events --socket "$STRATA_SOCKET" --recover-tail
-```
-
-This explicit option saves the unterminated suffix in a unique
-`.strata-recovery-*.bin` file, synchronizes that backup, then truncates only the
-suffix in the latest daily file. It never repairs a malformed newline-terminated
-record or an incomplete older day. A valid record missing only its final newline
-is still an incomplete suffix and will be quarantined. Retry the original request
-ID after recovery. If damage affected an acknowledged record, restore from trusted
-history rather than treating recovery as proof that no data was lost.
+Publication uses a synchronized private temporary file and an atomic no-replace
+rename. Unsupported filesystems fail rather than using a non-atomic fallback.
+Interrupted, unpublished files in `.strata-tmp/` are ignored; the operator may remove
+that directory while the daemon is stopped. Startup fails on malformed **published**
+files and never truncates them. The old `--recover-tail` option is removed. Preserve
+any damaged legacy file for review and restore from trusted history before restart.
 
 ## Guarantees and boundaries
 
@@ -155,8 +194,9 @@ history rather than treating recovery as proof that no data was lost.
 - Before success, the event bytes and containing directory are synchronized with
   `File::sync_all`. Errors stop further writes until restart. Actual power-loss
   durability depends on the OS, local filesystem, and hardware honoring sync.
-- A complete record surviving an uncertain write is verified and synchronized on
-  reopen before a retry can succeed. Interrupted suffixes are never silently lost.
+- A complete published record surviving an uncertain write is verified and
+  synchronized on reopen before a retry can succeed. Private unpublished bytes
+  are not authoritative.
 - Global sequences and previous hashes cross daily file boundaries. A backwards
   system clock rejects new events until it catches up; retries still work.
 - Files and socket default to mode `0600`; new store directories to `0700`.
@@ -168,10 +208,11 @@ history rather than treating recovery as proof that no data was lost.
   Separate OS identities/ACLs are another deployment option; permission setup is
   the operator's responsibility. Socket peers are not individually authenticated.
 - Local filesystems only. NFS, cloud-sync folders, hostile filesystem writers,
-  simultaneous Git mutations, encryption, and independent replica merges are out
+  external mutations of live event files, encryption, and independent replica merges are out
   of scope. Resource exhaustion and privileged tampering are not prevented.
-- Startup scans history. Memory retains IDs, request fingerprints, and receipts,
-  not all payloads. This intentionally favors simplicity over large-store scaling.
+- Steady-state memory retains IDs, request fingerprints, and receipts. Startup,
+  compaction, and verification temporarily load event bytes to validate and
+  deduplicate the history. This favors simplicity for small personal histories.
 
 ## Library
 
@@ -203,8 +244,9 @@ cargo build --release --locked
 
 The toolchain and dependency lockfile are committed. Tests cover concurrent CLI
 clients, duplicate retries, restart, day rollover, tampering, baseline preservation,
-unsafe paths, invalid inputs, and every byte cut of a representative interrupted
-record. These simulate torn writes; they do not emulate physical power failure.
+unsafe paths, invalid inputs, every byte cut of a representative unpublished
+record, interrupted compaction, working-tree/index disagreement, and staged history
+preservation. These simulate interrupted operations, not physical power failure.
 
 CI tests macOS ARM64 and Linux x86-64, checks the declared minimum Rust version,
 and audits dependencies against RustSec. Release workflow dispatch builds downloadable

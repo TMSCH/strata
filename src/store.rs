@@ -1,10 +1,14 @@
-use crate::record::{Append, Event, MAX_RECORD, Receipt, day, decode, encode};
-use anyhow::{Context, Result, bail, ensure};
+use crate::{
+    layout::{self, Snapshot},
+    record::{Append, Event, Receipt, day, encode},
+};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, DirBuilder, File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufReader, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -15,8 +19,8 @@ struct Seen {
     receipt: Receipt,
 }
 
-/// Holds the exclusive writer lock until dropped. External file changes while
-/// open are unsupported: stop the writer before Git checkout/restore operations.
+/// Holds the exclusive writer lock. Staging may run concurrently; checkout,
+/// reset, restore, or any other external mutation requires stopping the writer.
 pub struct Store {
     dir: PathBuf,
     _lock: File,
@@ -44,74 +48,103 @@ fn open_regular(path: &Path, write: bool, create: bool) -> Result<File> {
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
     ensure!(
-        file.metadata()?.is_file(),
-        "not a regular file: {}",
-        path.display()
-    );
-    ensure!(
-        file.metadata()?.nlink() == 1,
-        "hard-linked file rejected: {}",
+        file.metadata()?.is_file() && file.metadata()?.nlink() == 1,
+        "expected regular, non-hard-linked file: {}",
         path.display()
     );
     Ok(file)
 }
 
-fn lock_dir(dir: &Path) -> Result<File> {
+fn real_dir(path: &Path) -> Result<()> {
     ensure!(
-        fs::symlink_metadata(dir)?.file_type().is_dir(),
-        "store must be a real directory, not a symlink"
+        fs::symlink_metadata(path)?.file_type().is_dir(),
+        "expected real directory: {}",
+        path.display()
     );
-    let lock = open_regular(&dir.join(".strata.lock"), true, true)?;
-    lock.try_lock().context(
-        "store is already in use (stop the daemon before verification or Git operations)",
-    )?;
-    Ok(lock)
+    Ok(())
 }
 
-fn files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
+fn create_dir(path: &Path) -> Result<()> {
+    match DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => real_dir(path)?,
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+fn files(dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("non-UTF-8 store filename"))?;
+        if name == ".strata.lock"
+            || name.starts_with(".strata-recovery-")
+            || layout::auxiliary(&name)
+        {
+            continue;
+        }
+        if name == ".strata-tmp" {
+            real_dir(&entry.path())?;
+            continue;
+        }
         if name.ends_with(".jsonl") {
-            ensure!(
-                name.is_ascii() && name.len() == 16,
-                "unexpected JSONL filename: {name}"
-            );
-            let date = time::Date::parse(
-                &name[..10],
-                time::macros::format_description!("[year]-[month]-[day]"),
-            )?;
-            ensure!(date.to_string() == name[..10], "invalid daily filename");
-            paths.push(entry.path());
+            layout::location(&name)?;
+            names.push(name);
+        } else {
+            layout::date(&name)?;
+            real_dir(&entry.path())?;
+            for child in fs::read_dir(entry.path())? {
+                let child = child?;
+                let file = child
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF-8 event filename"))?;
+                let relative = format!("{name}/{file}");
+                layout::location(&relative)?;
+                names.push(relative);
+            }
         }
     }
-    paths.sort();
-    Ok(paths)
+    names.sort();
+    Ok(names)
+}
+
+fn snapshot(dir: &Path) -> Result<Snapshot> {
+    let mut result = Snapshot::default();
+    for name in files(dir)? {
+        let file = open_regular(&dir.join(&name), false, false)?;
+        result.add(&name, BufReader::new(&file))?;
+        // Recover a fully published but unacknowledged record durably.
+        file.sync_all()?;
+    }
+    result.validate()?;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            File::open(entry.path())?.sync_all()?;
+        }
+    }
+    File::open(dir)?.sync_all()?;
+    Ok(result)
 }
 
 impl Store {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_recovery(dir, false)
-    }
-
-    /// Recovery is explicit: only an unterminated suffix in the last daily file
-    /// can be quarantined. All preceding complete records must verify first.
-    pub fn open_with_recovery(dir: impl AsRef<Path>, recover_tail: bool) -> Result<Self> {
         let dir = dir.as_ref();
-        if !dir.exists() {
-            DirBuilder::new()
-                .mode(0o700)
-                .create(dir)
-                .context("create store (its parent directory must already exist)")?;
-        }
-        let lock = lock_dir(dir)?;
+        create_dir(dir).context("create store (its parent must already exist)")?;
+        let lock = open_regular(&dir.join(".strata.lock"), true, true)?;
+        lock.try_lock()
+            .context("store is already in use; use verify --staged for live Git snapshots")?;
         let parent = dir
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         File::open(parent)?.sync_all()?;
+        let data = snapshot(dir)?;
         let mut store = Self {
             dir: dir.to_owned(),
             _lock: lock,
@@ -121,116 +154,29 @@ impl Store {
             last_time: None,
             poisoned: false,
         };
-        store.scan(recover_tail)?;
+        store.load(&data)?;
         Ok(store)
     }
 
-    fn scan(&mut self, recover_tail: bool) -> Result<()> {
-        let paths = files(&self.dir)?;
-        for (i, path) in paths.iter().enumerate() {
-            let file = open_regular(path, false, false)?;
-            let mut reader = BufReader::new(file);
-            let mut offset = 0u64;
-            loop {
-                let mut line = Vec::new();
-                (&mut reader)
-                    .take((MAX_RECORD + 1) as u64)
-                    .read_until(b'\n', &mut line)?;
-                if line.is_empty() {
-                    break;
-                }
-                ensure!(
-                    line.len() <= MAX_RECORD,
-                    "oversized record in {}",
-                    path.display()
-                );
-                if !line.ends_with(b"\n") {
-                    ensure!(
-                        recover_tail && i + 1 == paths.len(),
-                        "incomplete final record in {}; use serve --recover-tail after review",
-                        path.display()
-                    );
-                    self.quarantine(path, offset, &line)?;
-                    break;
-                }
-                let (event, hash) = decode(&line)
-                    .with_context(|| format!("{} at byte {offset}", path.display()))?;
-                ensure!(
-                    event.sequence == self.sequence + 1,
-                    "sequence gap or reordering in {}",
-                    path.display()
-                );
-                ensure!(
-                    event.previous == self.head,
-                    "broken hash chain in {}",
-                    path.display()
-                );
-                let timestamp = OffsetDateTime::parse(&event.recorded_at, &Rfc3339)?;
-                ensure!(
-                    day(timestamp) == path.file_name().unwrap().to_string_lossy(),
-                    "record date does not match filename"
-                );
-                ensure!(
-                    self.last_time.is_none_or(|last| timestamp >= last),
-                    "recording time moved backwards"
-                );
-                ensure!(
-                    !self.seen.contains_key(&event.id),
-                    "duplicate event id: {}",
-                    event.id
-                );
-                let request = Append {
-                    id: event.id.clone(),
-                    kind: event.kind,
-                    data: event.data,
-                };
-                let receipt = Receipt {
-                    id: event.id.clone(),
-                    sequence: event.sequence,
-                    hash: hash.clone(),
-                    file: day(timestamp),
-                };
-                self.seen.insert(
-                    event.id,
-                    Seen {
-                        fingerprint: request.fingerprint()?,
-                        receipt,
-                    },
-                );
-                self.sequence = event.sequence;
-                self.head = Some(hash);
-                self.last_time = Some(timestamp);
-                offset += line.len() as u64;
-            }
-            // A complete record may have survived a crash before its original
-            // sync/ack. Make recovered records durable before accepting retries.
-            reader.get_ref().sync_all()?;
+    fn load(&mut self, data: &Snapshot) -> Result<()> {
+        self.seen.clear();
+        for record in data.records.values() {
+            self.seen.insert(
+                record.event.id.clone(),
+                Seen {
+                    fingerprint: record.request().fingerprint()?,
+                    receipt: record.receipt(),
+                },
+            );
         }
-        File::open(&self.dir)?.sync_all()?;
-        Ok(())
-    }
-
-    fn quarantine(&self, path: &Path, offset: u64, suffix: &[u8]) -> Result<()> {
-        let backup = self
-            .dir
-            .join(format!(".strata-recovery-{}.bin", uuid::Uuid::new_v4()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&backup)?;
-        file.write_all(suffix)?;
-        file.sync_all()?;
-        File::open(&self.dir)?.sync_all()?;
-        let original = open_regular(path, true, false)?;
-        original.set_len(offset)?;
-        original.sync_all()?;
-        eprintln!(
-            "strata: quarantined {} incomplete bytes from {} to {}",
-            suffix.len(),
-            path.display(),
-            backup.display()
-        );
+        let status = data.status();
+        self.sequence = status.events;
+        self.head = status.head;
+        self.last_time = data
+            .records
+            .last_key_value()
+            .map(|(_, r)| OffsetDateTime::parse(&r.event.recorded_at, &Rfc3339))
+            .transpose()?;
         Ok(())
     }
 
@@ -261,6 +207,9 @@ impl Store {
             self.last_time.is_none_or(|last| now >= last),
             "system clock moved backwards; wait for it to catch up"
         );
+        if self.last_time.is_some_and(|last| last.date() < now.date()) {
+            self.compact_before(&day(now)[..10])?;
+        }
         let event = Event {
             version: 1,
             sequence: self.sequence.checked_add(1).context("sequence exhausted")?,
@@ -271,17 +220,18 @@ impl Store {
             data: request.data,
         };
         let (bytes, hash) = encode(&event)?;
-        let filename = day(now);
+        let folder = &day(now)[..10];
+        let filename = format!("{folder}/{hash}.json");
         let receipt = Receipt {
             id: request.id.clone(),
             sequence: event.sequence,
             hash: hash.clone(),
             file: filename.clone(),
         };
-        // A failed write or sync has an uncertain outcome. Never continue from
-        // the old in-memory head; reopening must revalidate the actual disk.
         self.poisoned = true;
-        self.write_record(&filename, &bytes)?;
+        create_dir(&self.dir.join(folder))?;
+        File::open(&self.dir)?.sync_all()?;
+        self.publish(&filename, &bytes)?;
         self.sequence = event.sequence;
         self.head = Some(hash);
         self.last_time = Some(now);
@@ -296,22 +246,84 @@ impl Store {
         Ok(receipt)
     }
 
-    fn write_record(&self, filename: &str, bytes: &[u8]) -> Result<()> {
-        let path = self.dir.join(filename);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)?;
-        ensure!(
-            file.metadata()?.is_file() && file.metadata()?.nlink() == 1,
-            "daily log must be a regular, non-hard-linked file"
-        );
+    /// Publish whole bytes atomically without replacing an existing path.
+    fn publish(&self, filename: &str, bytes: &[u8]) -> Result<()> {
+        let temporary = self.dir.join(".strata-tmp");
+        create_dir(&temporary)?;
+        let mut file = tempfile::NamedTempFile::new_in(&temporary)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
-        File::open(&self.dir)?.sync_all()?;
+        file.as_file().sync_all()?;
+        let target = self.dir.join(filename);
+        // Do not fall back to a hard link: a crash between link/unlink would
+        // conflict with the non-hard-linked-file invariant on recovery.
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            file.path(),
+            rustix::fs::CWD,
+            &target,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .context("atomic no-replace publication (local filesystem required)")?;
+        File::open(target.parent().unwrap())?.sync_all()?;
+        File::open(&temporary)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Archive completed UTC days. Safe to retry after any interrupted step.
+    /// Library users can call this periodically; the daemon does so automatically.
+    pub fn compact(&mut self) -> Result<()> {
+        self.compact_before(&day(OffsetDateTime::now_utc())[..10])
+    }
+
+    fn compact_before(&mut self, today: &str) -> Result<()> {
+        ensure!(
+            !self.poisoned,
+            "writer stopped after a storage error; restart before compaction"
+        );
+        let names = files(&self.dir)?;
+        let days: std::collections::BTreeSet<_> = names
+            .iter()
+            .filter_map(|name| name.split_once('/').map(|(d, _)| d).filter(|d| *d < today))
+            .collect();
+        if days.is_empty() {
+            return Ok(());
+        }
+        self.poisoned = true;
+        let data = snapshot(&self.dir)?;
+        for date in days {
+            let loose: Vec<_> = names
+                .iter()
+                .filter(|n| n.starts_with(&format!("{date}/")))
+                .collect();
+            // Records already covered by a published archive only need cleanup.
+            let uncovered: Vec<_> = data
+                .records
+                .values()
+                .filter(|r| r.file.starts_with(&format!("{date}/")))
+                .collect();
+            if !uncovered.is_empty() {
+                let bytes: Vec<_> = uncovered
+                    .iter()
+                    .flat_map(|r| r.bytes.iter().copied())
+                    .collect();
+                let primary = format!("{date}.jsonl");
+                let filename = if self.dir.join(&primary).try_exists()? {
+                    format!("{date}--{:x}.jsonl", Sha256::digest(&bytes))
+                } else {
+                    primary
+                };
+                self.publish(&filename, &bytes)?;
+            }
+            // Archives are synchronized before any source is removed.
+            for name in loose {
+                fs::remove_file(self.dir.join(name))?;
+            }
+            File::open(self.dir.join(date))?.sync_all()?;
+            fs::remove_dir(self.dir.join(date))?;
+            File::open(&self.dir)?.sync_all()?;
+        }
+        self.load(&snapshot(&self.dir)?)?;
+        self.poisoned = false;
         Ok(())
     }
 
@@ -324,8 +336,7 @@ impl Store {
     }
 }
 
-/// Offline verification. An optional independently trusted earlier directory
-/// detects tail deletion or a consistently rehashed replacement history.
+/// Offline verification. Baseline comparison ignores physical file placement.
 pub fn verify(dir: impl AsRef<Path>, baseline: Option<&Path>) -> Result<Verification> {
     ensure!(dir.as_ref().is_dir(), "store does not exist");
     let store = Store::open(dir)?;
@@ -334,11 +345,13 @@ pub fn verify(dir: impl AsRef<Path>, baseline: Option<&Path>) -> Result<Verifica
         ensure!(baseline.is_dir(), "baseline does not exist");
         let previous = Store::open(baseline)?;
         for (id, old) in &previous.seen {
-            let Some(current) = store.seen.get(id) else {
-                bail!("baseline event missing: {id}");
-            };
+            let current = store
+                .seen
+                .get(id)
+                .with_context(|| format!("baseline event missing: {id}"))?;
             ensure!(
-                current.receipt == old.receipt,
+                current.receipt.hash == old.receipt.hash
+                    && current.receipt.sequence == old.receipt.sequence,
                 "baseline event changed: {id}"
             );
         }

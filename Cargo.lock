@@ -414,6 +414,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

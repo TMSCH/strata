@@ -2,11 +2,26 @@
 
 ## Files and order
 
-Authoritative data is the set of `YYYY-MM-DD.jsonl` files directly in the store
-root. All other names are local metadata or unrelated files. Any filename ending
-in `.jsonl` must be a valid ASCII date filename. Dates use UTC and years 0000–9999.
-Read daily files in filename order, and records within a file in line order.
-Empty daily files are valid, including one created before a failed first append.
+Authoritative data is the union of:
+
+- `YYYY-MM-DD/<event-hash>.json`: exactly one complete envelope plus LF.
+- `YYYY-MM-DD.jsonl`: immutable daily archive, records in increasing sequence order.
+- `YYYY-MM-DD--<archive-sha256>.jsonl`: immutable supplement when an archive
+  already exists (for example, a legacy daily file).
+
+Dates use UTC and years 0000–9999. The hash in a loose filename must match its
+record. Supplement names use SHA-256 of all archive bytes, with lowercase hex.
+Globally sort the union by `sequence` after deduplicating identical records;
+lexicographic file order is not event order. Identical copies across files are
+allowed during compaction. Conflicting records at the same sequence, duplicate IDs
+at different sequences, gaps, broken links, and out-of-order archive records fail.
+Empty archives are accepted for compatibility with legacy stores; loose files must
+contain exactly one record.
+
+`.strata.lock`, `.strata-tmp/`, and legacy `.strata-recovery-*` files are local-only
+metadata and must not be staged. The store root may also contain `.gitignore`,
+`.gitattributes`, and `README.md`. Other names are rejected. Staged data files must
+be ordinary, non-executable Git blobs; symlinks and submodules are rejected.
 
 Each completed record is a compact UTF-8 JSON object followed by exactly one LF
 byte. No BOM, blank lines, CRLF, or trailing whitespace. Each line is at most
@@ -48,7 +63,7 @@ updates must pass golden vectors. Introducing another encoding needs a new versi
 
 - `id`: caller request identity, globally unique in this store. 1–128 restricted
   ASCII bytes, as documented in README. Retrying identical normalized type/data
-  with that ID returns the original receipt. A different payload/type is an error.
+  with that ID returns the same event identity, hash, and sequence. A different payload/type is an error.
 - `recorded_at`: daemon UTC time in RFC 3339; optional fractional seconds. Must not
   precede the previous record and must match the filename date. It does not mean
   that the described activity occurred at that time.
@@ -58,7 +73,8 @@ updates must pass golden vectors. Introducing another encoding needs a new versi
 - `sequence`: the store's global order. Timestamps and IDs do not replace it.
 
 Receipts have `id`, `sequence`, `hash`, and `file`. There is no mutable head file
-or authoritative index. All state can be reconstructed from the JSONL files.
+or authoritative index. The `file` field is a current location hint that can change
+after compaction. All state is reconstructed from the event files and archives.
 
 ## Socket protocol
 
@@ -72,11 +88,23 @@ append. A transport error has an unknown outcome: retry the same request ID.
 ## Trust and recovery
 
 Checks verify a chain's internal consistency, not its completeness relative to a
-past state. Trusted baseline verification checks all earlier receipts, including
-their hashes/sequences/file names. A removed tail or fully rehashed replacement
-can otherwise be self-consistent. Git anchoring belongs to the trusted orchestrator.
+past state. Trusted baseline verification requires every earlier event's exact
+bytes to remain present, regardless of physical file placement. A removed tail or
+fully rehashed replacement can otherwise be self-consistent.
 
-There is no merge or compaction format. The only supported mutation of existing
-bytes is explicit operator recovery of an unterminated final suffix, after durable
-quarantine. That is not a claim that the suffix was never acknowledged: a later
-filesystem corruption or hostile truncation can resemble an interrupted write.
+Staged verification uses `git write-tree` to capture one immutable index snapshot,
+reads raw blobs from that tree, and compares with a resolved trusted commit (HEAD
+by default). It returns both object IDs. The trusted owner must commit that exact
+tree, serialize updates to the index/ref, and prevent baseline rollback. A new
+unstaged suffix is not detectable; verification guarantees preservation of the
+baseline, not inclusion of every latest daemon acknowledgement.
+
+New appends are written and synchronized in `.strata-tmp/`, then atomically renamed
+without replacing an existing path. The destination directory is synchronized
+before acknowledgement. A crash leaves either a complete published event or an
+ignored private temporary file. Published malformed bytes always fail validation.
+
+Compaction publishes and synchronizes an immutable archive first, then deletes
+its covered loose files and synchronizes those directories. Overlap is valid and
+cleanup is restartable. Existing archives never change. Event encoding/version,
+hashes, IDs, and sequences are unaffected. Divergent replica merges are unsupported.

@@ -62,7 +62,7 @@ fn handle(mut stream: UnixStream, store: &Mutex<Store>) -> Result<()> {
 
 /// Blocking local server with four fixed workers and one serialized writer.
 /// Socket parent directory must be private and controlled by the operator.
-pub fn serve(store: Store, socket: &Path) -> Result<()> {
+pub fn serve(mut store: Store, socket: &Path) -> Result<()> {
     let parent = socket
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -109,12 +109,26 @@ pub fn serve(store: Store, socket: &Path) -> Result<()> {
     let listener =
         UnixListener::bind(socket).context("bind Unix socket (use a short absolute path)")?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    store.compact()?;
     let store = Arc::new(Mutex::new(store));
     eprintln!("strata: listening on {}", socket.display());
     let listeners = (0..4)
         .map(|_| listener.try_clone())
         .collect::<std::io::Result<Vec<_>>>()?;
     thread::scope(|scope| -> Result<()> {
+        let maintenance = Arc::clone(&store);
+        scope.spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(60));
+                let Ok(mut store) = maintenance.lock() else {
+                    break;
+                };
+                if let Err(error) = store.compact() {
+                    eprintln!("strata: compaction stopped: {error:#}");
+                    break;
+                }
+            }
+        });
         for listener in listeners {
             let store = Arc::clone(&store);
             scope.spawn(move || {

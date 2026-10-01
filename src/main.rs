@@ -31,16 +31,26 @@ enum Command {
         dir: PathBuf,
         #[arg(long, env = "STRATA_SOCKET")]
         socket: PathBuf,
-        /// Quarantine and remove an incomplete last line after reviewing damage.
-        #[arg(long)]
-        recover_tail: bool,
     },
-    /// Operator: verify an offline store, optionally against a trusted snapshot.
+    /// Operator: verify an offline store or a live daemon's staged Git snapshot.
     Verify {
         #[arg(long)]
-        dir: PathBuf,
-        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long, requires = "dir")]
         baseline: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["dir", "baseline"], requires_all = ["repo", "path"])]
+        staged: bool,
+        #[arg(long, requires = "staged")]
+        repo: Option<PathBuf>,
+        /// Store directory relative to the repository root, e.g. events.
+        #[arg(long, requires = "staged")]
+        path: Option<String>,
+        /// Trusted earlier commit; defaults to HEAD.
+        #[arg(long, requires = "staged", conflicts_with = "initial")]
+        baseline_ref: Option<String>,
+        /// Explicitly verify the first snapshot in an unborn repository.
+        #[arg(long, requires = "staged")]
+        initial: bool,
     },
 }
 
@@ -59,18 +69,37 @@ fn run() -> Result<()> {
             let receipt = protocol::append(&socket, &Append { id, kind, data })?;
             println!("{}", serde_json::to_string(&receipt)?);
         }
-        Command::Serve {
-            dir,
-            socket,
-            recover_tail,
-        } => {
-            protocol::serve(Store::open_with_recovery(dir, recover_tail)?, &socket)?;
+        Command::Serve { dir, socket } => {
+            protocol::serve(Store::open(dir)?, &socket)?;
         }
-        Command::Verify { dir, baseline } => {
-            println!(
-                "{}",
-                serde_json::to_string(&strata::verify(dir, baseline.as_deref())?)?
-            );
+        Command::Verify {
+            dir,
+            baseline,
+            staged,
+            repo,
+            path,
+            baseline_ref,
+            initial,
+        } => {
+            if staged {
+                println!(
+                    "{}",
+                    serde_json::to_string(&strata::git::verify_staged(
+                        repo.as_deref().context("--repo is required")?,
+                        path.as_deref().context("--path is required")?,
+                        baseline_ref.as_deref(),
+                        initial
+                    )?)?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&strata::verify(
+                        dir.context("provide --dir or --staged")?,
+                        baseline.as_deref()
+                    )?)?
+                );
+            }
         }
     }
     Ok(())

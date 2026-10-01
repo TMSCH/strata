@@ -1,6 +1,8 @@
 #![doc = include_str!("../README.md")]
 //! A single-writer, hash-linked JSONL store. See README.md and FORMAT.md.
 #![cfg(unix)]
+pub mod git;
+mod layout;
 pub mod protocol;
 pub mod record;
 pub mod store;
