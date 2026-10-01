@@ -18,7 +18,7 @@ at different sequences, gaps, broken links, and out-of-order archive records fai
 Empty archives are accepted for compatibility with legacy stores; loose files must
 contain exactly one record.
 
-`.strata.lock`, `.strata-tmp/`, and legacy `.strata-recovery-*` files are local-only
+`.git`, `.strata.lock`, `.strata-tmp/`, and legacy `.strata-recovery-*` files are local-only
 metadata and must not be staged. The store root may also contain `.gitignore`,
 `.gitattributes`, and `README.md`. Other names are rejected. Staged data files must
 be ordinary, non-executable Git blobs; symlinks and submodules are rejected.
@@ -104,7 +104,11 @@ without replacing an existing path. The destination directory is synchronized
 before acknowledgement. A crash leaves either a complete published event or an
 ignored private temporary file. Published malformed bytes always fail validation.
 
-Compaction publishes and synchronizes an immutable archive first, then deletes
-its covered loose files and synchronizes those directories. Overlap is valid and
+Compaction publishes and synchronizes an immutable archive first. Inside a Git
+repository, cleanup waits until every archive for that day is an ordinary blob in
+HEAD with identical raw bytes (without Git filters). The index or an archive on
+another branch is insufficient. Git failures defer cleanup rather than allowing it.
+Outside Git, durable publication is sufficient. Eligible cleanup deletes covered
+loose files and synchronizes those directories. Overlap is valid and
 cleanup is restartable. Existing archives never change. Event encoding/version,
 hashes, IDs, and sequences are unaffected. Divergent replica merges are unsupported.

@@ -2,6 +2,11 @@
 
 ## 0.1.0 (unreleased)
 
+Compaction now detects Git repositories and retains loose events until the exact
+daily archives are committed in HEAD. Ordinary Git commits and bundle backups need
+no Strata-specific verification hook. Git failures defer cleanup without stopping
+appends; standalone stores still clean up after durable publication.
+
 Rust library, Unix-socket daemon, append CLI, durable acknowledgements, and
 restart-safe retry IDs. Events are published as immutable hash-named JSON files
 and compacted into daily JSONL archives. Verification supports offline directories

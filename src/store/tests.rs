@@ -396,3 +396,191 @@ fn archive_order_duplicates_and_supplement_hash_are_checked() {
     .unwrap();
     assert!(Store::open(dir.path()).is_err());
 }
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn cleanup_waits_for_exact_archive_in_head_not_index_or_other_branch() {
+    let root = tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    let dir = root.path().join("events");
+    let mut s = Store::open(&dir).unwrap();
+    let a = s.append_at(request("a"), at(29)).unwrap();
+    s.compact_before("2026-09-30").unwrap();
+    let archive = dir.join("2026-09-29.jsonl");
+    let original = fs::read(&archive).unwrap();
+    assert!(dir.join(&a.file).exists());
+    git(root.path(), &["add", "events/2026-09-29.jsonl"]);
+    s.compact_before("2026-09-30").unwrap();
+    assert!(dir.join(&a.file).exists(), "staged is not committed");
+    // Commit wrong bytes, then restore the valid working archive.
+    fs::write(&archive, b"wrong bytes\n").unwrap();
+    git(root.path(), &["add", "events/2026-09-29.jsonl"]);
+    git(root.path(), &["commit", "-qm", "wrong archive"]);
+    fs::write(&archive, &original).unwrap();
+    s.compact_before("2026-09-30").unwrap();
+    assert!(dir.join(&a.file).exists());
+    let old = git(root.path(), &["rev-parse", "HEAD"]);
+    git(root.path(), &["add", "events/2026-09-29.jsonl"]);
+    git(root.path(), &["commit", "-qm", "correct archive"]);
+    git(root.path(), &["branch", "saved"]);
+    git(root.path(), &["reset", "--soft", &old]);
+    s.compact_before("2026-09-30").unwrap();
+    assert!(dir.join(&a.file).exists(), "other branch is not HEAD");
+    git(root.path(), &["commit", "-qm", "correct current archive"]);
+    drop(s);
+    let mut s = Store::open(&dir).unwrap();
+    s.compact_before("2026-09-30").unwrap();
+    assert!(!dir.join(&a.file).exists());
+    assert_eq!(fs::read(archive).unwrap(), original);
+    assert_eq!(s.append_at(request("a"), at(30)).unwrap().hash, a.hash);
+    git(root.path(), &["add", "-u"]);
+    assert_eq!(git(root.path(), &["diff", "--cached", "--name-only"]), "");
+}
+
+#[test]
+fn cleanup_detects_git_initialized_after_store_open_and_broken_git_marker() {
+    let root = tempdir().unwrap();
+    let dir = root.path().join("events");
+    let mut s = Store::open(&dir).unwrap();
+    let a = s.append_at(request("a"), at(29)).unwrap();
+    fs::write(
+        root.path().join(".git"),
+        b"gitdir: /nonexistent-strata-git\n",
+    )
+    .unwrap();
+    s.compact_before("2026-09-30").unwrap();
+    assert!(dir.join(&a.file).exists());
+    assert_eq!(s.append_at(request("b"), at(30)).unwrap().sequence, 2);
+    fs::remove_file(root.path().join(".git")).unwrap();
+    git(root.path(), &["init", "-q"]);
+    s.compact_before("2026-09-30").unwrap();
+    assert!(dir.join(&a.file).exists());
+    git(root.path(), &["add", "events/2026-09-29.jsonl"]);
+    git(root.path(), &["commit", "-qm", "archive"]);
+    s.compact_before("2026-09-30").unwrap();
+    assert!(!dir.join(&a.file).exists());
+}
+
+#[test]
+fn linked_worktree_and_literal_directory_names_are_supported() {
+    let root = tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    git(root.path(), &["commit", "--allow-empty", "-qm", "initial"]);
+    let worktree = root.path().join("worktree");
+    git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "other",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let dir = worktree.join("events [personal]");
+    let mut s = Store::open(&dir).unwrap();
+    let a = s.append_at(request("a"), at(29)).unwrap();
+    s.compact_before("2026-09-30").unwrap();
+    assert!(dir.join(&a.file).exists());
+    git(
+        &worktree,
+        &["add", "--", "events [personal]/2026-09-29.jsonl"],
+    );
+    git(&worktree, &["commit", "-qm", "archive"]);
+    s.compact_before("2026-09-30").unwrap();
+    assert!(!dir.join(&a.file).exists());
+}
+
+#[test]
+fn every_supplement_must_be_committed_before_day_cleanup() {
+    let root = tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    let dir = root.path().join("events");
+    let mut s = Store::open(&dir).unwrap();
+    let a = s.append_at(request("a"), at(29)).unwrap();
+    s.compact_before("2026-09-30").unwrap();
+    let b = s.append_at(request("b"), at(29)).unwrap();
+    s.compact_before("2026-09-30").unwrap();
+    git(root.path(), &["add", "events/2026-09-29.jsonl"]);
+    git(root.path(), &["commit", "-qm", "primary archive"]);
+    s.compact_before("2026-09-30").unwrap();
+    assert!(dir.join(&a.file).exists() && dir.join(&b.file).exists());
+    let supplement = files(&dir)
+        .unwrap()
+        .into_iter()
+        .find(|n| n.contains("--"))
+        .unwrap();
+    git(root.path(), &["add", &format!("events/{supplement}")]);
+    git(root.path(), &["commit", "-qm", "supplement"]);
+    s.compact_before("2026-09-30").unwrap();
+    assert!(!dir.join("2026-09-29").exists());
+    assert_eq!(s.status().events, 2);
+}
+
+#[test]
+fn ordinary_commits_and_clone_preserve_events_through_cleanup() {
+    let root = tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    fs::write(root.path().join(".gitignore"), "events/.strata*\n").unwrap();
+    let dir = root.path().join("events");
+    let mut s = Store::open(&dir).unwrap();
+    let receipt = s.append_at(request("a"), at(29)).unwrap();
+    git(root.path(), &["add", "-A"]);
+    git(root.path(), &["commit", "-qm", "loose event"]);
+    s.compact_before("2026-09-30").unwrap();
+    // A commit that stages only known paths must retain the loose event.
+    git(root.path(), &["add", "-u"]);
+    assert_eq!(git(root.path(), &["diff", "--cached", "--name-only"]), "");
+    assert!(dir.join(&receipt.file).exists());
+    git(root.path(), &["add", "-A"]);
+    git(root.path(), &["commit", "-qm", "archive and loose event"]);
+    s.compact_before("2026-09-30").unwrap();
+    git(root.path(), &["add", "-A"]);
+    git(root.path(), &["commit", "-qm", "cleanup"]);
+    let clone = root.path().join("restored");
+    git(
+        root.path(),
+        &["clone", "-q", "--no-local", ".", clone.to_str().unwrap()],
+    );
+    let recovered = Store::open(clone.join("events")).unwrap();
+    assert_eq!(recovered.status().head, Some(receipt.hash));
+    assert_eq!(recovered.status().events, 1);
+}
+
+#[test]
+fn closing_store_releases_lock_even_if_descriptor_was_inherited() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    // Like a descriptor inherited by fork, this shares the open description.
+    let inherited = store._lock.try_clone().unwrap();
+    drop(store);
+    let reopened = Store::open(dir.path()).unwrap();
+    drop(inherited);
+    assert!(Store::open(dir.path()).is_err());
+    drop(reopened);
+    assert!(Store::open(dir.path()).is_ok());
+}
