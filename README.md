@@ -276,3 +276,23 @@ remain private (0600/0700). Existing records need an offline permission migratio
 The socket parent must still be operator-owned and not group-writable. Protect
 the store parent and Git metadata from the agent as well. Group membership grants
 append access, not caller authentication or permission to rewrite old events.
+
+Release archives built after v0.1.1 also receive signed GitHub build provenance.
+The release workflow verifies each archive's attestation against this repository,
+the release workflow identity, and the exact source commit and ref before publishing.
+The existing v0.1.1 release has checksums only; this does not retroactively attest it.
+
+For a subsequent release, verify its downloaded archive with:
+
+```sh
+gh attestation verify strata-x86_64-unknown-linux-musl.tar.gz \
+  --repo TMSCH/strata \
+  --signer-workflow TMSCH/strata/.github/workflows/release.yml \
+  --source-ref refs/tags/v<VERSION> \
+  --source-digest <REVIEWED_COMMIT_SHA> \
+  --deny-self-hosted-runners
+```
+
+Replace the placeholders with the selected release and its reviewed commit.
+For deployments, retain an independently reviewed SHA-256 in your configuration
+and check it on every installation; provenance verification complements this pin.

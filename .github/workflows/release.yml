@@ -7,6 +7,11 @@ permissions:
   contents: read
 jobs:
   build:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +62,10 @@ jobs:
           cp README.md FORMAT.md LICENSE dist/
           tar -czf "strata-${TARGET}.tar.gz" -C dist strata README.md FORMAT.md LICENSE
           shasum -a 256 "strata-${TARGET}.tar.gz" > "strata-${TARGET}.tar.gz.sha256"
+      - name: Attest release archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: strata-${{ matrix.target }}.tar.gz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: strata-${{ matrix.target }}
@@ -72,10 +81,19 @@ jobs:
           merge-multiple: true
       - name: Verify both downloaded release packages
         working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
         run: |
           test "$(find . -name '*.tar.gz' | wc -l)" -eq 2
           sha256sum -c strata-*.tar.gz.sha256
           for archive in strata-*.tar.gz; do
+            gh attestation verify "$archive" --repo "$GH_REPO" \
+              --signer-workflow "$GH_REPO/.github/workflows/release.yml" \
+              --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+              --deny-self-hosted-runners
             tar -tzf "$archive" | sort > contents.txt
             printf '%s\n' FORMAT.md LICENSE README.md strata | sort > expected.txt
             diff -u expected.txt contents.txt
