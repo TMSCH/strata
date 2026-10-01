@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
-    io::BufReader,
+    io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{Command, Stdio},
 };
@@ -50,42 +50,68 @@ fn read_tree(repo: &Path, tree: &str, path: &str) -> Result<Snapshot> {
     let listing = git(repo, &["ls-tree", "-r", "-z", "--full-tree", tree])?;
     let prefix = format!("{path}/");
     let mut snapshot = Snapshot::default();
-    for entry in listing.split(|b| *b == 0).filter(|b| !b.is_empty()) {
-        let tab = entry
-            .iter()
-            .position(|b| *b == b'\t')
-            .context("invalid Git tree entry")?;
-        let name = &entry[tab + 1..];
-        ensure!(name != path.as_bytes(), "store path is a file or submodule");
-        let Some(relative) = name.strip_prefix(prefix.as_bytes()) else {
-            continue;
-        };
-        let relative = std::str::from_utf8(relative).context("non-UTF-8 store path")?;
-        let header = std::str::from_utf8(&entry[..tab])?;
-        let parts: Vec<_> = header.split(' ').collect();
-        ensure!(
-            parts.len() == 3 && parts[0] == "100644" && parts[1] == "blob",
-            "expected ordinary non-executable file: {relative}"
-        );
-        if layout::auxiliary(relative) {
-            continue;
-        }
-        layout::location(relative).with_context(|| {
+    // A single batch reader avoids spawning a process for every loose event.
+    // Object IDs come from the captured tree, never from mutable working files.
+    let mut child = command(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let result =
+        (|| -> Result<()> {
+            for entry in listing.split(|b| *b == 0).filter(|b| !b.is_empty()) {
+                let tab = entry
+                    .iter()
+                    .position(|b| *b == b'\t')
+                    .context("invalid Git tree entry")?;
+                let name = &entry[tab + 1..];
+                ensure!(name != path.as_bytes(), "store path is a file or submodule");
+                let Some(relative) = name.strip_prefix(prefix.as_bytes()) else {
+                    continue;
+                };
+                let relative = std::str::from_utf8(relative).context("non-UTF-8 store path")?;
+                let header = std::str::from_utf8(&entry[..tab])?;
+                let parts: Vec<_> = header.split(' ').collect();
+                ensure!(
+                    parts.len() == 3 && parts[0] == "100644" && parts[1] == "blob",
+                    "expected ordinary non-executable file: {relative}"
+                );
+                if layout::auxiliary(relative) {
+                    continue;
+                }
+                layout::location(relative).with_context(|| {
             format!("unexpected tracked store file: {relative}; exclude local lock/temporary files")
         })?;
-        let mut child = command(repo)
-            .args(["cat-file", "blob", parts[2]])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let result = snapshot.add(relative, BufReader::new(child.stdout.take().unwrap()));
-        if result.is_err() {
-            let _ = child.kill();
-        }
-        let status = child.wait()?;
-        result?;
-        ensure!(status.success(), "cannot read Git blob for {relative}");
+                writeln!(input, "{}", parts[2])?;
+                input.flush()?;
+                let mut response = String::new();
+                (&mut output).take(256).read_line(&mut response)?;
+                ensure!(response.ends_with('\n'), "invalid Git batch header");
+                let fields: Vec<_> = response.split_whitespace().collect();
+                ensure!(
+                    fields.len() == 3 && fields[0] == parts[2] && fields[1] == "blob",
+                    "unexpected Git batch object"
+                );
+                let size: u64 = fields[2].parse().context("invalid Git blob size")?;
+                let mut content = (&mut output).take(size);
+                snapshot.add(relative, &mut content)?;
+                ensure!(content.limit() == 0, "truncated Git blob");
+                let mut delimiter = [0];
+                output.read_exact(&mut delimiter)?;
+                ensure!(delimiter == *b"\n", "invalid Git batch delimiter");
+            }
+            Ok(())
+        })();
+    drop(input);
+    if result.is_err() {
+        let _ = child.kill();
     }
+    let status = child.wait()?;
+    result?;
+    ensure!(status.success(), "cannot read Git batch");
     snapshot.validate()?;
     Ok(snapshot)
 }
