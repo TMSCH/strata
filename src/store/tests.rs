@@ -570,3 +570,17 @@ fn ordinary_commits_and_clone_preserve_events_through_cleanup() {
     assert_eq!(recovered.status().head, Some(receipt.hash));
     assert_eq!(recovered.status().events, 1);
 }
+
+#[test]
+fn closing_store_releases_lock_even_if_descriptor_was_inherited() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    // Like a descriptor inherited by fork, this shares the open description.
+    let inherited = store._lock.try_clone().unwrap();
+    drop(store);
+    let reopened = Store::open(dir.path()).unwrap();
+    drop(inherited);
+    assert!(Store::open(dir.path()).is_err());
+    drop(reopened);
+    assert!(Store::open(dir.path()).is_ok());
+}
